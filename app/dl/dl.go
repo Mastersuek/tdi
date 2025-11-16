@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
@@ -38,6 +39,9 @@ type Options struct {
 	Desc       bool
 	Takeout    bool
 	Group      bool // auto detect grouped message
+
+	// optimization control
+	ForceWebCheck bool // force network-based skip-same check instead of using metadata optimization
 
 	// resume opts
 	Continue, Restart bool
@@ -79,6 +83,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	it, err := newIter(pool, manager, dialogs, opts, viper.GetDuration(consts.FlagDelay), dlProgress)
 	if err != nil {
+		// Check if this is the "no messages found" error
+		if strings.Contains(err.Error(), "no messages found") || strings.Contains(err.Error(), "all dialogs contain 0 messages") {
+			color.Yellow("Download attempted on 0 messages, skipping...")
+			return nil // Return nil to exit gracefully without error
+		}
 		return err
 	}
 
@@ -119,10 +128,35 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	color.Green("All files will be downloaded to '%s' dir", opts.Dir)
 
+	// Warn users if using skip-same optimization with a template that doesn't include MessageID
+	// Only show warning if optimization is actually enabled (not using --force-web-check)
+	if opts.SkipSame && !opts.ForceWebCheck && !strings.Contains(opts.Template, "MessageID") {
+		color.Yellow("WARNING: Your template does not include MessageID - files may be skipped due to name collisions")
+		color.Yellow("         Consider adding {{ .MessageID }} to your template for unique filenames")
+	}
+
 	go dlProgress.Render()
 	defer prog.Wait(ctx, dlProgress)
 
-	return downloader.New(options).Download(ctx, limit)
+	rerr = downloader.New(options).Download(ctx, limit)
+
+	// Log optimization statistics if skip-same was used
+	if opts.SkipSame && !opts.ForceWebCheck {
+		hits, networkChecks := it.GetOptimizationStats()
+		totalChecks := hits + networkChecks
+		if totalChecks > 0 {
+			savedCalls := hits * 2 // Each optimized skip saves 2 network calls (FromInputPeer + GetSingleMessage)
+			percentOptimized := float64(hits) / float64(totalChecks) * 100
+
+			logctx.From(ctx).Info("Skip-same optimization summary",
+				zap.Int64("files_skipped_without_network", hits),
+				zap.Int64("files_checked_via_network", networkChecks),
+				zap.Int64("network_calls_saved", savedCalls),
+				zap.Float64("optimization_efficiency_percent", percentOptimized))
+		}
+	}
+
+	return rerr
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {

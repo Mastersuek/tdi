@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"strings"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram/downloader"
@@ -42,21 +43,40 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 
 		wg.Go(func() (rerr error) {
 			d.opts.Progress.OnAdd(elem)
-			defer func() { d.opts.Progress.OnDone(elem, rerr) }()
+			// Important: OnDone must receive the actual error for proper cleanup
+			// We use a separate variable to control errgroup behavior
+			var downloadErr error
+			defer func() {
+				// Pass the download error to OnDone for cleanup, regardless of what we return
+				d.opts.Progress.OnDone(elem, downloadErr)
+			}()
 
-			if err := d.download(wgctx, elem); err != nil {
-				// canceled by user, so we directly return error to stop all
-				if errors.Is(err, context.Canceled) {
-					return errors.Wrap(err, "download")
+			downloadErr = d.download(wgctx, elem)
+			if downloadErr != nil {
+				// Check for network errors first (before context.Canceled check)
+				// Network errors may have context.Canceled wrapped in them, but they're recoverable
+				var netErr *NetworkError
+				var stallErr *ServerStallingError
+				if errors.As(downloadErr, &netErr) || errors.As(downloadErr, &stallErr) {
+					// These are non-fatal errors - don't stop the entire download batch
+					// OnDone will handle cleanup via the deferred call above
+					return nil
 				}
 
-				// don't return error, just log it
+				// canceled by user, so we directly return error to stop all
+				if errors.Is(downloadErr, context.Canceled) {
+					return errors.Wrap(downloadErr, "download")
+				}
+
+				// Other errors - log them but don't stop the batch
+				// OnDone will handle cleanup via the deferred call above
 				logctx.
 					From(ctx).
 					Error("Download error",
 						zap.Any("element", elem),
-						zap.Error(err),
+						zap.Error(downloadErr),
 					)
+				return nil
 			}
 
 			return nil
@@ -90,8 +110,115 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		WithThreads(tutil.BestThreads(elem.File().Size(), d.opts.Threads)).
 		Parallel(ctx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
 	if err != nil {
+		// Check for network EOF errors (connection dropped during transfer)
+		// These should not be fatal - file will be retried with --continue flag
+		if isNetworkError(err) {
+			return &NetworkError{underlying: err}
+		}
+		// Check if this is a "create invoker" error with "context canceled" which indicates
+		// the server is stalling or refusing the connection (hangs at 0%)
+		if isServerStallingError(err) {
+			return &ServerStallingError{underlying: err}
+		}
 		return errors.Wrap(err, "download")
 	}
 
 	return nil
+}
+
+// ServerStallingError indicates the server is stalling/refusing the download
+type ServerStallingError struct {
+	underlying error
+}
+
+func (e *ServerStallingError) Error() string {
+	return "server stalling or refusing download"
+}
+
+func (e *ServerStallingError) Unwrap() error {
+	return e.underlying
+}
+
+// NetworkError indicates a network/connection error during download (non-fatal, can retry)
+type NetworkError struct {
+	underlying error
+}
+
+func (e *NetworkError) Error() string {
+	return "network connection error during download"
+}
+
+func (e *NetworkError) Unwrap() error {
+	return e.underlying
+}
+
+// Known error patterns from gotd library that indicate server stalling/refusing connection from upstream issue
+// https://github.com/gotd/td/issues/1030
+var stallingErrorPatterns = [][]string{
+	{"create invoker", "context canceled"},
+	{"export auth", "context canceled"},
+}
+
+// isServerStallingError checks if the error indicates server is stalling the download
+// This matches error patterns from the gotd/td library when the server refuses
+// to establish a connection, similar to how the retry middleware handles gotd errors
+func isServerStallingError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Check all known stalling patterns
+	for _, pattern := range stallingErrorPatterns {
+		allMatch := true
+		for _, substring := range pattern {
+			if !strings.Contains(errStr, substring) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return true
+		}
+	}
+
+	return false
+}
+
+// References:
+// - Go io package: https://pkg.go.dev/io#EOF
+// - Go net package errors: https://pkg.go.dev/net
+// - gotd/td downloader.Parallel: https://pkg.go.dev/github.com/gotd/td/telegram/downloader#Builder.Parallel
+// - Telegram file API: https://core.telegram.org/api/files#downloading-files
+var networkErrorPatterns = [][]string{
+	{"EOF"},
+	{"connection reset"},
+	{"broken pipe"},
+	{"i/o timeout"},
+}
+
+// isNetworkError checks if the error is a network/connection error
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Check all known network error patterns
+	for _, pattern := range networkErrorPatterns {
+		allMatch := true
+		for _, substring := range pattern {
+			if !strings.Contains(errStr, substring) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return true
+		}
+	}
+
+	return false
 }
